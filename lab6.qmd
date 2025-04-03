@@ -1,0 +1,407 @@
+---
+title: "Lab 6"
+author: "Caitlin Rasbid"
+date: "2025-04-04"
+format: html
+execute:
+  echo: true
+---
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+```
+
+```{r}
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+```
+```{r}
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+
+remote_files  <- glue('{root}/camels_{types}.txt')
+
+local_files   <- glue('data/camels_{types}.txt')
+
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+camels <- map(local_files, read_delim, show_col_types = FALSE) 
+
+camels <- power_full_join(camels ,by = 'gauge_id')
+```
+
+# Question 1
+The zero_q_freq variable is the frequency of days where Q = 0 mm/day as a percentage, with Q being discharge, a measure of the volume of water flowing past a point on a stream.
+
+# Exploratory Data Analysis
+```{r}
+ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = q_mean)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map()
+```
+# Question 2 
+```{r}
+camels_long <- camels %>%
+  pivot_longer(cols = c(aridity, p_mean), 
+               names_to = "variable", 
+               values_to = "value")
+
+ggplot(data = camels_long, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = value)) +  
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map() +
+  facet_wrap(~ variable, scales = "free") + 
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  labs(
+    title = "Maps of Aridity and P-Mean",  
+    x = "Longitude", 
+    y = "Latitude",  
+    color = "Measurement Value"  
+  )
+  
+
+```
+
+
+# Model Preparation & Building
+```{r}
+camels |> 
+  select(aridity, p_mean, q_mean) |> 
+  drop_na() |> 
+  cor()
+```
+
+```{r}
+
+ggplot(camels, aes(x = aridity, y = p_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm", color = "red", linetype = 2) +
+  scale_color_viridis_c() +
+  theme_linedraw() + 
+  theme(legend.position = "bottom") + 
+  labs(title = "Aridity vs Rainfall vs Runnoff", 
+       x = "Aridity", 
+       y = "Rainfall",
+       color = "Mean Flow")
+```
+```{r}
+ggplot(camels, aes(x = aridity, y = p_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm") +
+  scale_color_viridis_c() +
+  scale_x_log10() + 
+  scale_y_log10() +
+  theme_linedraw() +
+  theme(legend.position = "bottom") + 
+  labs(title = "Aridity vs Rainfall vs Runnoff", 
+       x = "Aridity", 
+       y = "Rainfall",
+       color = "Mean Flow")
+```
+```{r}
+ggplot(camels, aes(x = aridity, y = p_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm") +
+  scale_color_viridis_c(trans = "log") +
+  scale_x_log10() + 
+  scale_y_log10() +
+  theme_linedraw() +
+  theme(legend.position = "bottom",
+        legend.key.width = unit(2.5, "cm"),
+        legend.key.height = unit(.5, "cm")) + 
+  labs(title = "Aridity vs Rainfall vs Runnoff", 
+       x = "Aridity", 
+       y = "Rainfall",
+       color = "Mean Flow") 
+```
+
+```{r}
+set.seed(123)
+
+camels <- camels |> 
+  mutate(logQmean = log(q_mean))
+
+camels_split <- initial_split(camels, prop = 0.8)
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+
+camels_cv <- vfold_cv(camels_train, v = 10)
+```
+
+```{r}
+rec <-  recipe(logQmean ~ aridity + p_mean, data = camels_train) %>%
+  step_log(all_predictors()) %>%
+  step_interact(terms = ~ aridity:p_mean) |> 
+  step_naomit(all_predictors(), all_outcomes())
+```
+
+```{r}
+
+baked_data <- prep(rec, camels_train) |> 
+  bake(new_data = NULL)
+
+lm_base <- lm(logQmean ~ aridity * p_mean, data = baked_data)
+summary(lm_base)
+
+
+summary(lm(logQmean ~ aridity + p_mean + aridity_x_p_mean, data = baked_data))
+```
+
+```{r}
+test_data <-  bake(prep(rec), new_data = camels_test)
+test_data$lm_pred <- predict(lm_base, newdata = test_data)
+
+metrics(test_data, truth = logQmean, estimate = lm_pred)
+
+ggplot(test_data, aes(x = logQmean, y = lm_pred, colour = aridity)) +
+  scale_color_gradient2(low = "brown", mid = "orange", high = "darkgreen") +
+  geom_point() +
+  geom_abline(linetype = 2) +
+  theme_linedraw() + 
+  labs(title = "Linear Model: Observed vs Predicted",
+       x = "Observed Log Mean Flow",
+       y = "Predicted Log Mean Flow",
+       color = "Aridity")
+```
+
+```{r}
+
+lm_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+lm_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(lm_model) %>%
+  fit(data = camels_train) 
+
+
+summary(extract_fit_engine(lm_wf))$coefficients
+summary(lm_base)$coefficients
+```
+```{r}
+
+lm_data <- augment(lm_wf, new_data = camels_test)
+dim(lm_data)
+```
+```{r}
+metrics(lm_data, truth = logQmean, estimate = .pred)
+ggplot(lm_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+```
+
+```{r}
+library(baguette)
+rf_model <- rand_forest() %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+rf_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(rf_model) %>%
+  fit(data = camels_train) 
+
+rf_data <- augment(rf_wf, new_data = camels_test)
+dim(rf_data)
+
+metrics(rf_data, truth = logQmean, estimate = .pred)
+ggplot(rf_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+```
+
+```{r}
+wf <- workflow_set(list(rec), list(lm_model, rf_model)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv) 
+
+autoplot(wf)
+
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+```
+# Question 3
+```{r}
+# Boost Tree 
+bt_model <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+bt_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(bt_model) %>%
+  fit(data = camels_train) 
+
+bt_data <- augment(bt_wf, new_data = camels_test)
+dim(bt_data)
+
+metrics(bt_data, truth = logQmean, estimate = .pred)
+
+ggplot(bt_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+```
+```{r}
+# Neural Network
+nnet_model <- bag_mlp() %>%
+  set_engine("nnet") %>%
+  set_mode("regression")
+
+nnet_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(nnet_model) %>%
+  fit(data = camels_train) 
+
+nnet_data <- augment(nnet_wf, new_data = camels_test)
+dim(nnet_data)
+
+metrics(nnet_data, truth = logQmean, estimate = .pred)
+
+ggplot(nnet_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+```
+```{r}
+# Add to existing workflow
+wf <- workflow_set(list(rec), list(lm_model, rf_model, nnet_model, bt_model)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv) 
+
+autoplot(wf)
+
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+```
+Compared to the other two models, the Neural Network model outperforms the other models and the Xgboost Regression model underperforms the other models. The linear model is still ranked above the Xgboost model and this could be because the tree-based method of the Xgboost model was not able to capture complexities in the relatively small dataset. However, the linear model was outperformed by the random forest model and neural network, suggesting a simple linear relationship is not sufficient to explain the interactions between terms. The flexible nature of the Neural Network model and its ability to capture complexities of the dataset and learn from complex interactions makes it the best model, as demonstrated in the above table and graph. For these reasons I would continue with the Neural Network model.
+
+# Build Your Own
+
+
+```{r}
+#Data Splitting
+set.seed(124)
+
+camels <- camels %>%
+  mutate(logQmean = log(q_mean)) %>%
+  select(logQmean, p_mean, aridity, soil_depth_pelletier, max_water_content, organic_frac, frac_snow, pet_mean, soil_depth_statsgo, elev_mean) %>%
+  drop_na()
+
+c_split <- initial_split(camels, prop = 0.8)
+c_train <- training(c_split)
+c_test  <- testing(c_split)
+
+c_cv <- vfold_cv(c_train, v = 10)
+```
+
+```{r}
+# Recipe
+rec2 <-  recipe(logQmean ~ . , data = c_train) %>%
+  step_scale(all_predictors()) %>%
+  step_center(all_predictors()) 
+```
+I chose to use the above formula because it compares the predictors to the log transformed Q mean. Doing a log transformation on the Q mean proved to establish a more predictable relationship between the predictors p_mean and aridity, so I maintained this log transformation. Since there are many predictors, I chose to use step_scale and step_center to normalize the data on a universal scale and allow for more accurate model creation. 
+
+```{r}
+c_baked <- prep(rec2, c_train) |> 
+  bake(new_data = NULL)
+
+lm_base2 <- lm(logQmean ~ . , data = c_baked)
+summary(lm_base2)
+```
+```{r}
+# Linear Model
+lm_model2 <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+lm_wf2 <- workflow() %>%
+  add_recipe(rec2) %>%
+  add_model(lm_model2) %>%
+  fit(data = c_train)
+summary(extract_fit_engine(lm_wf2))$coefficients
+
+lm_data2 <- augment(lm_wf2, new_data = c_test)
+metrics(lm_data2, truth = logQmean, estimate = .pred)
+
+# Random Forest Model
+rf_model2 <- rand_forest() %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+rf_wf2 <- workflow() %>%
+  add_recipe(rec2) %>%
+  add_model(rf_model2) %>%
+  fit(data = c_train)
+
+rf_data2 <- augment(rf_wf2, new_data = c_test)
+metrics(rf_data2, truth = logQmean, estimate = .pred)
+
+# Boost Tree
+bt_model2 <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+bt_wf2 <- workflow() %>%
+  add_recipe(rec2) %>%
+  add_model(bt_model2) %>%
+  fit(data = c_train) 
+
+bt_data2 <- augment(bt_wf2, new_data = c_test)
+
+metrics(bt_data2, truth = logQmean, estimate = .pred)
+
+# Neural Network
+
+nnet_model2 <- bag_mlp() %>%
+  set_engine("nnet") %>%
+  set_mode("regression")
+
+nnet_wf2 <- workflow() %>%
+  add_recipe(rec2) %>%
+  add_model(nnet_model2) %>%
+  fit(data = c_train) 
+
+nnet_data2 <- augment(nnet_wf2, new_data = c_test)
+
+metrics(nnet_data2, truth = logQmean, estimate = .pred)
+```
+```{r}
+# Workflow Set
+wf2 <- workflow_set(list(rec2), list(lm_model2, rf_model2, nnet_model2, bt_model2)) %>%
+  workflow_map('fit_resamples', resamples = c_cv) 
+# Evaluation
+autoplot(wf2)
+
+rank_results(wf2, rank_metric = "rsq", select_best = TRUE)
+```
+The best model evaluating the relationship between logQmean and the predictor variables turned out to be the Neural Network model. Similar to the previous example, the flexibility of this model and its ability to capture complex interactions and relationships makes it the best model. The relationships between variables is non-linear, making the linear model insufficient and decision-tree based models perform better than the linear, but ultimately not as well as the neural network. It ranks first compared to all other model types for its R-squared value, with >94 % of the variation in logQmean being accounted for by the predictor variables. For these reasons the Neural Network model is the best of them all.
+
+```{r}
+# Extract and Evaluate 
+# workflow created in initial model creation above
+ggplot(nnet_data2, aes(x = logQmean, y = .pred)) +
+  scale_color_viridis_c() +
+  geom_point(color = "blue", alpha = 0.6) +
+  geom_abline() +
+  theme_linedraw() +
+  labs(
+    title = "Observed vs. Predicted Log Mean Streamflow",
+    x = "Observed logQmean",
+    y = "Predicted logQmean"
+  ) +
+  theme_minimal()
+```
+The model seems to be a good fit for predicting logQmean across a number of predictor variables. The line of best fit represents the overall trend and slope of the data, although there is some variation between actual and predicted values. I think this model could be fine tuned by including even more predictor variables to increase its predictive capacity. However, no model will be 100% accurate in predicting streamflow on a given day due to daily variations and the presence of outliers, so I think this model is an excellent start for making predictions.
