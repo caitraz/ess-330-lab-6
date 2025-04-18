@@ -1,0 +1,277 @@
+---
+title: "hyperparameter tuning"
+author: "Caitlin Rasbid"
+format: html
+execute:
+  echo: true
+---
+
+```{r}
+# Data Import/Tidy/Transform
+library(tidymodels)
+library(tidyverse)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+
+# Read in Data
+
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+
+remote_files  <- glue('{root}/camels_{types}.txt')
+
+local_files   <- glue('data/camels_{types}.txt')
+
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+
+camels <- map(local_files, read_delim, show_col_types = FALSE) 
+
+camels <- power_full_join(camels ,by = 'gauge_id')
+```
+```{r}
+# Clean Data
+
+library(dplyr)
+library(ggpubr)
+library(skimr)
+library(visdat)
+
+camels_clean <- camels %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  mutate(logQmean = log(q_mean)) %>%
+  drop_na()
+
+skim(camels_clean)
+vis_miss(camels_clean)
+vis_dat(camels_clean)
+
+ggplot(camels_clean, aes(x = aridity, y = p_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm", color = "red", linetype = 2) +
+  scale_color_viridis_c() +
+  theme_linedraw() + 
+  theme(legend.position = "bottom") + 
+  labs(title = "Aridity vs Rainfall vs Runnoff", 
+       x = "Aridity", 
+       y = "Rainfall",
+       color = "Mean Flow")
+```
+```{r}
+# Data Splitting
+
+
+ 
+
+set.seed(123)
+split <- initial_split(camels_clean, prop = 0.8)
+train <- training(split)
+test  <- testing(split)
+
+
+```
+
+```{r}
+# Feature Engineering
+
+rec <-  recipe(logQmean ~ aridity + p_mean, data = train) %>%
+  step_log(all_predictors()) %>%
+  step_interact(terms = ~ aridity:p_mean)
+  
+```
+
+```{r}
+# Resampling and Model Testing
+
+# 1 build resamples
+cv <- vfold_cv(train, v = 10)
+
+#2 Build 3 candidate models
+baked_data <- prep(rec, train) |> 
+  bake(new_data = NULL)
+
+lm_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+lm_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(lm_model) %>%
+  fit(data = train) 
+
+rf_model <- rand_forest() %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+rf_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(rf_model) %>%
+  fit(data = train) 
+
+bt_model <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+bt_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(bt_model) %>%
+  fit(data = train) 
+
+# 3 Test the Models
+wf <- workflow_set(list(rec), list(lm_model, rf_model, bt_model)) %>%
+  workflow_map('fit_resamples', resamples = cv) 
+
+autoplot(wf)
+
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+```
+#4 Model Selection
+I am choosing the random forest model to move forward with. This is because it uses a decision tree based model for regression that will combine predictions from multiple different decision trees that will make the data overall more generalizeable. Despite it performing slightly under the linear model, I thought this would be the best choice as it has hyperparameters that can be tuned to make it perform even better than the linear model once it has been tuned. The engine is ranger and the mode is regression. I think the reason that this model is a good choice for this specific problem is that unlike the linear model, it is capable of capturing nonlinear relationships. Since the log transformations make the relationship between the predicted and predictor variables more linear, I thought it necessary to introduce a model that can capture other relationships that are not being represented by a linear model alone. 
+
+```{r}
+# Tuning
+
+#1 Build A Model 
+rf_spec <- rand_forest(
+  mtry = tune(),
+  min_n = tune(),
+  trees = 1000) %>%
+  set_engine("ranger") %>%
+  set_mode("regression") 
+
+#2 Create a Workflow
+rf_spec_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(rf_spec)
+
+#3 Check Tunable Ranges
+dials <- extract_parameter_set_dials(rf_spec)
+dials$object <- finalize(dials$object, train)
+
+#4 Define Search Space
+my.grid <- grid_latin_hypercube(dials$object, size = 25)
+
+#5 Tune the Model
+model_params <-  tune_grid(
+    rf_spec_wf,
+    resamples = cv,
+    grid = my.grid,
+    metrics = metric_set(rmse, rsq, mae),
+    control = control_grid(save_pred = TRUE)
+  )
+
+autoplot(model_params)
+```
+
+The randomly selected predictors are representative of the mtry hyperparameter and are largely scattered, indicating that mtry does not have a strong effect on the metrics. The minimal node size is representative of the min_n parameter and suggests that for MAE and RMSE, both values decrease as min_n increases, with the gains tapering off as Minimal Node Size increases past 25. The rsq value increases as min_n increases and levels off, indicating that the model explains more variance with a greater node size, but that these gains lessen after a certain point, about 30. The grid indicates that the most impactful parameter is min_n and the effect of mtry is negligable. The optimal performance of this model would include a min_n with values between 25-35. 
+
+```{r}
+#6 Check Skill of Tuned Model
+collect_metrics(model_params) %>%
+  filter(.metric == "rsq") %>%
+  arrange(desc(mean))
+
+show_best(model_params, metric = "rsq")
+
+hp_best <- select_best(model_params, metric = "rsq")
+```
+```{r}
+#7 Finalize Model
+final_wf <- finalize_workflow(
+  rf_spec_wf,
+  hp_best
+)
+```
+
+```{r}
+# Final Model Verification
+final_fit <- last_fit(
+  final_wf,
+  split = split
+)
+collect_metrics(final_fit)
+```
+The final model performs slightly worse than on the training data, with this model having an rsq value of 0.789 while the tuned model had a best rsq value of 0.796. I think that because these values are relatively close to each other, the model still is a good representation of the whole dataset and will be able to make pretty accurate predictions. 
+```{r}
+final_preds <- collect_predictions(final_fit)
+print(final_preds)
+
+library(ggplot2)
+
+ggplot(final_preds, aes(x = logQmean, y = .pred)) +
+  geom_point(alpha = 0.6, color = "#1f78b4") +
+  geom_smooth(method = "lm", se = FALSE, color = "#33a02c") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray30") +
+  scale_x_continuous(name = "Actual Values") +
+  scale_y_continuous(name = "Predicted Values") +
+  labs(
+    title = "Predicted vs Actual Values",
+    subtitle = "Final Model Performance on Test Set"
+  ) +
+  theme_minimal()
+
+```
+```{r}
+# Building a Map
+final_model <- fit(final_wf, data = camels_clean)
+
+library(broom)
+augmented_data <- augment(final_model, new_data = camels_clean) %>%
+  mutate(residual = (.pred - logQmean)^2)
+
+library(ggplot2)
+library(patchwork)
+
+library(ggplot2)
+library(patchwork)
+
+# Prediction map
+map_preds <- ggplot(augmented_data, aes(x = gauge_lon, y = gauge_lat, color = .pred)) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  scale_color_viridis_c(option = "plasma", name = "Prediction") +
+  ggthemes::theme_map() +
+  coord_fixed() +
+  labs(
+    title = "Predicted Values",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  )
+
+# Residual map
+map_resid <- ggplot(augmented_data, aes(x = gauge_lon, y = gauge_lat, color = residual)) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  scale_color_viridis_c(option = "inferno", trans = "sqrt", name = "Residual") +
+  ggthemes::theme_map() +
+  coord_fixed() +
+  labs(
+    title = "Residuals (Squared Error)",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  )
+
+# Combine with patchwork
+map_preds + map_resid + plot_layout(ncol = 2)
+
+
+
+```
+

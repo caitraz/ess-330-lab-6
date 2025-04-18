@@ -139,7 +139,7 @@ camels_cv <- vfold_cv(camels_train, v = 10)
 ```{r}
 rec <-  recipe(logQmean ~ aridity + p_mean, data = camels_train) %>%
   step_log(all_predictors()) %>%
-  step_interact(terms = ~ aridity:p_mean) |> 
+  step_interact(terms = ~ aridity:p_mean) %>%
   step_naomit(all_predictors(), all_outcomes())
 ```
 
